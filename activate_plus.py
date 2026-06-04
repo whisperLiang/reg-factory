@@ -73,16 +73,21 @@ def main():
         sys.exit(1)
     print(f"  access_token: {access_token[:18]}... (len={len(access_token)}) email={email or '?'}")
 
-    code = plus_baxi._norm_code(args.code) if args.code else plus_baxi.next_card(verify=True)
-    if not code:
-        print("  [FAIL] 没有可用卡密(--code 或 BAXI_CARDS 池为空/已用尽)")
-        sys.exit(1)
-
-    ok, remaining, msg = plus_baxi.verify_card(code)
-    print(f"  [baxi] 卡密 {code}: ok={ok} remaining={remaining} ({msg})")
-    if not ok or remaining <= 0:
-        print("  [FAIL] 卡密不可用")
-        sys.exit(1)
+    if args.code:
+        # 显式指定卡密：验一次
+        code = plus_baxi._norm_code(args.code)
+        ok, remaining, msg = plus_baxi.verify_card(code)
+        print(f"  [baxi] 卡密 {code}: ok={ok} remaining={remaining} ({msg})")
+        if not ok or remaining <= 0:
+            print("  [FAIL] 卡密不可用")
+            sys.exit(1)
+    else:
+        # 从卡密池取：next_card(verify=True) 已验过，不重复验
+        code = plus_baxi.next_card(verify=True)
+        if not code:
+            print("  [FAIL] 没有可用卡密(BAXI_CARDS 池为空/已用尽)")
+            sys.exit(1)
+        print(f"  [baxi] 卡密 {code}: 取自卡密池(已验)")
 
     print(f"  [baxi] 提交开通 Plus（轮询上限 {args.timeout}s）...")
     status, detail = plus_baxi.activate(code, access_token, timeout=args.timeout)

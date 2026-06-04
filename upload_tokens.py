@@ -55,6 +55,12 @@ def _mark_uploaded(platform, target, key):
 
 
 def upload_chatgpt():
+    """从已存网页 session 批量灌 CPA / SUB2API（Path A，兜底用）。
+
+    ⚠️ 网页 session 无 refresh_token，CPA 用合成 id_token，下游过期后无法续期。
+    Codex 进 SUB2API/CPA 的**正路是 oauth_codex.py（Path B，带真 refresh_token）**；
+    本路径仅用于没走 OAuth 的批量兜底。
+    """
     files = sorted(glob.glob(os.path.join(TOKEN_OUTPUT_DIR, "chatgpt", "*.session.json")))
     if not files:
         print("[chatgpt] 无 *.session.json，跳过")

@@ -63,10 +63,8 @@ def find_group_id(origin, token, group_name, timeout=DEFAULT_TIMEOUT):
     raise RuntimeError(f"SUB2API 未找到 openai 分组: {group_name}")
 
 
-def generate_auth_url(origin, token, redirect_uri=REDIRECT_URI, proxy_id=None, timeout=DEFAULT_TIMEOUT):
+def generate_auth_url(origin, token, redirect_uri=REDIRECT_URI, timeout=DEFAULT_TIMEOUT):
     body = {"redirect_uri": redirect_uri}
-    if proxy_id:
-        body["proxy_id"] = int(proxy_id)
     d = _sub2api_request(origin, "/api/v1/admin/openai/generate-auth-url",
                          token=token, method="POST", body=body, timeout=timeout)
     auth_url = str((d or {}).get("auth_url") or (d or {}).get("authUrl") or "").strip()
@@ -84,10 +82,8 @@ def _state_from_url(url):
         return ""
 
 
-def exchange_code(origin, token, session_id, code, state, proxy_id=None, timeout=60):
+def exchange_code(origin, token, session_id, code, state, timeout=60):
     body = {"session_id": session_id, "code": code, "state": state}
-    if proxy_id:
-        body["proxy_id"] = int(proxy_id)
     return _sub2api_request(origin, "/api/v1/admin/openai/exchange-code",
                             token=token, method="POST", body=body, timeout=timeout)
 
@@ -106,7 +102,7 @@ def build_oauth_credentials(exchange_data):
 
 
 def create_oauth_account(origin, token, credentials, group_ids, name="",
-                         proxy_id=None, priority=DEFAULT_PRIORITY, timeout=60):
+                         priority=DEFAULT_PRIORITY, timeout=60):
     payload = {
         "name": name or credentials.get("email") or "codex-oauth",
         "notes": "",
@@ -119,8 +115,6 @@ def create_oauth_account(origin, token, credentials, group_ids, name="",
         "group_ids": [int(g) for g in group_ids if g],
         "auto_pause_on_expired": True,
     }
-    if proxy_id:
-        payload["proxy_id"] = int(proxy_id)
     extra = {}
     for k in ("email", "plan_type"):
         if credentials.get(k):
@@ -231,7 +225,11 @@ async def _goto_add_phone(page, auth_url, account_email, timeout=45):
 
 async def handle_add_phone(page, auth_url="", account_email="", attempts=5, sms_timeout=180):
     """auth.openai.com/add-phone:接码平台租号→填→收码→提交，被拒/收不到码就**回退页面**换号重试。
-    成功(离开 add-phone)返回 True。"""
+    成功(离开 add-phone)返回 True。
+
+    ⚠️ WIP：自动接码路径未充分验证（OpenAI 对普通虚拟号风控严，SMS_PROJECT_ID_OPENAI 默认空）。
+    当前推荐用 oauth_codex.py --manual-phone 手动填号 + 输 WhatsApp 码；全自动接码版后续完善。
+    """
     from common import sms
     from config import (SMS_PROJECT_ID_OPENAI, HERO_SMS_SERVICE_OPENAI,
                         SMS_MAXPRICE_OPENAI, SMS_COUNTRY_BLACKLIST_OPENAI)

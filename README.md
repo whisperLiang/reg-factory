@@ -209,6 +209,9 @@ python upload_tokens.py            # all（chatgpt + grok）
 python upload_tokens.py chatgpt    # 只传 ChatGPT（CPA + SUB2API）
 python upload_tokens.py grok       # 只传 Grok（webchat2api）
 ```
+> ⚠️ ChatGPT 这条是 **Path A（兜底）**：从网页 session 上传，**无 `refresh_token`**（CPA 用合成
+> id_token），下游过期不能续期。**Codex 进 SUB2API/CPA 的正路是上面 ② 的 `oauth_codex.py`（带真
+> `refresh_token`）**；本路径仅供没走 OAuth 的批量兜底。
 
 ### ④ Claude / SuperGrok 订阅授权 🔜
 订阅入口走环境变量 `CLAUDE_SUB_URL`（`https://6661231.xyz/#/claude`）、
