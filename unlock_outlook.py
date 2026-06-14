@@ -80,7 +80,10 @@ def _parse_proxy(s):
 
 def create_browser(name="unlock", proxy_str=None):
     data = {"name": name, "remark": "outlook unlock",
-            "proxyMethod": 2, "browserFingerPrint": {"coreVersion": "130"}}
+            "proxyMethod": 2,
+            "credentialsEnableService": False,
+            "syncAuthorization": False,
+            "browserFingerPrint": {"coreVersion": "130"}}
     p = _parse_proxy(proxy_str)
     if p:
         data.update({"proxyType": p.get("type", "http"),
@@ -92,7 +95,10 @@ def create_browser(name="unlock", proxy_str=None):
     return _bb_post("/browser/update", data)["data"]["id"]
 
 def open_browser(pid):
-    d = _bb_post("/browser/open", {"id": pid})["data"]
+    d = _bb_post("/browser/open", {
+        "id": pid,
+        "args": ["--disable-save-password-bubble", "--credentials-enable-service=false"]
+    })["data"]
     return d.get("ws") or d.get("webdriver")
 
 def close_browser(pid):

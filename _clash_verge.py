@@ -65,7 +65,7 @@ SPECIAL_NAMES = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBA
 # the connection. Any node name containing these substrings is filtered out.
 FAKE_NODE_HINTS = (
     "剩余流量", "剩余", "到期", "重置", "距离", "套餐", "官网", "客服",
-    "更新", "公告", "网址", "通知", "Expire", "Traffic", "Reset",
+    "更新", "公告", "通知", "Expire", "Traffic", "Reset",
     "expire", "traffic", "reset", "流量",
 )
 

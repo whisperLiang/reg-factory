@@ -101,8 +101,8 @@ def init_clash():
     return client, group
 
 
-def maybe_rotate(client, group, strategy="round_robin", max_latency_ms=6000,
-                 mixed_port=7897):
+def maybe_rotate(client, group, strategy="random", max_latency_ms=6000,
+                 mixed_port=7890):
     """Rotate to a fresh Clash node and verify egress IP actually changed.
     Uses rotate_with_verify which recurses into nested selector groups when
     the outer switch hits another group (e.g. GLOBAL -> 📲 Telegram is just
@@ -168,6 +168,8 @@ def bb_create_for_outlook_reg(name):
         "platformIcon": "outlook.live.com",
         "proxyMethod": 2,
         "proxyType": "noproxy",
+        "credentialsEnableService": False,
+        "syncAuthorization": False,
         "browserFingerPrint": {
             "ostype": "PC",
             "os": "Win32",
@@ -245,85 +247,176 @@ def write_record(record):
     return fname
 
 
-async def one_attempt(mod, proxy_str, idx):
-    """Mirrors bs_register_step1.fetch_email_from_self_register's inline
-    flow, but doesn't carry the breaker state — we're a dedicated loop and
-    want to keep trying."""
-    profile_id = None
-    bb = mod.BitBrowserClient()
-    try:
-        ts = datetime.now().strftime("%m%d_%H%M%S")
-        for _r in range(5):
-            try:
-                # Use our own create that picks coreVersion=146 (matches the
-                # BitBrowser install on this machine). Standalone's hardcoded
-                # 130 makes BB return 502.
-                profile_id = bb_create_for_outlook_reg(f"outlook_loop_{ts}_{idx}")
-                break
-            except Exception as e:
-                m = str(e)
-                if "最大" in m or "超过" in m:
-                    log("BitBrowser quota — cleanup_browsers(keep=2)", "WARN")
-                    try: bb.cleanup_browsers(keep=2)
-                    except Exception: pass
-                    await asyncio.sleep(3)
-                    continue
-                if _r >= 4:
-                    raise
-                log(f"create_browser err (try {_r+1}/5): {m[:200]}", "WARN")
-                await asyncio.sleep(3 + _r)
-        if not profile_id:
-            return None, None, []
-        info = bb.open_browser(profile_id)
-        ws = info.get("ws", "")
-        if not ws:
-            return None, None, []
-        from playwright.async_api import async_playwright as _apw
-        async with _apw() as p:
-            browser = await p.chromium.connect_over_cdp(ws)
-            ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
-            # Scrub Chromium residual state so signup.live.com doesn't see a
-            # stale identity from a previous session.
-            try:
-                await ctx.clear_cookies()
-                for _pg in ctx.pages:
-                    try:
-                        c = await ctx.new_cdp_session(_pg)
-                        await c.send("Network.clearBrowserCookies")
-                        await c.send("Network.clearBrowserCache")
-                        try: await c.detach()
-                        except Exception: pass
-                        break
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            page = await ctx.new_page()
-            email, password = await mod.register_outlook(page, ctx, idx)
-            cookies = []
-            if email:
+async def one_attempt(mod, proxy_str, idx, driver="bitbrowser"):
+    """Register via BitBrowser or local headed Playwright Chrome."""
+    if driver == "bitbrowser":
+        profile_id = None
+        bb = mod.BitBrowserClient()
+        try:
+            ts = datetime.now().strftime("%m%d_%H%M%S")
+            for _r in range(5):
                 try:
-                    all_cookies = await ctx.cookies()
-                    keep_domains = (
-                        "outlook.", "live.com", "microsoftonline.",
-                        "microsoft.com", "office.com", ".office365.",
-                        "msn.com", "bing.com", "mail.live.com",
-                    )
-                    cookies = [
-                        c for c in all_cookies
-                        if any(d in (c.get("domain") or "") for d in keep_domains)
-                    ]
+                    profile_id = bb_create_for_outlook_reg(f"outlook_loop_{ts}_{idx}")
+                    break
                 except Exception as e:
-                    log(f"cookie export failed: {e}", "WARN")
-        return email, password, cookies
-    finally:
-        if profile_id:
-            try:
-                bb.close_browser(profile_id)
-                await asyncio.sleep(2)
-                bb.delete_browser(profile_id)
-            except Exception:
-                pass
+                    m = str(e)
+                    if "最大" in m or "超过" in m:
+                        log("BitBrowser quota — cleanup_browsers(keep=2)", "WARN")
+                        try:
+                            bb.cleanup_browsers(keep=2)
+                        except Exception:
+                            pass
+                        await asyncio.sleep(3)
+                        continue
+                    if _r >= 4:
+                        raise
+                    log(f"create_browser err (try {_r+1}/5): {m[:200]}", "WARN")
+                    await asyncio.sleep(3 + _r)
+            if not profile_id:
+                return None, None, []
+            info = bb.open_browser(profile_id)
+            ws = info.get("ws", "")
+            if not ws:
+                return None, None, []
+            from playwright.async_api import async_playwright as _apw
+            async with _apw() as p:
+                browser = await p.chromium.connect_over_cdp(ws)
+                ctx = browser.contexts[0] if browser.contexts else await browser.new_context()
+                try:
+                    await ctx.clear_cookies()
+                    for _pg in ctx.pages:
+                        try:
+                            c = await ctx.new_cdp_session(_pg)
+                            await c.send("Network.clearBrowserCookies")
+                            await c.send("Network.clearBrowserCache")
+                            try:
+                                await c.detach()
+                            except Exception:
+                                pass
+                            break
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                page = await ctx.new_page()
+                email, password = await mod.register_outlook(page, ctx, idx)
+                cookies = []
+                if email:
+                    try:
+                        all_cookies = await ctx.cookies()
+                        keep_domains = (
+                            "outlook.", "live.com", "microsoftonline.",
+                            "microsoft.com", "office.com", ".office365.",
+                            "msn.com", "bing.com", "mail.live.com",
+                        )
+                        cookies = [
+                            c for c in all_cookies
+                            if any(d in (c.get("domain") or "") for d in keep_domains)
+                        ]
+                    except Exception as e:
+                        log(f"cookie export failed: {e}", "WARN")
+            return email, password, cookies
+        finally:
+            if profile_id:
+                try:
+                    bb.close_browser(profile_id)
+                    await asyncio.sleep(2)
+                    bb.delete_browser(profile_id)
+                except Exception:
+                    pass
+    else:
+        # local headed Playwright Chrome
+        from playwright.async_api import async_playwright as _apw
+        
+        playwright_proxy = None
+        if proxy_str:
+            playwright_proxy = {"server": f"http://{proxy_str}"}
+
+        try:
+            async with _apw() as pw:
+                args = [
+                    "--no-sandbox", "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-default-apps",
+                    "--disable-extensions",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--window-size=1280,800",
+                    "--disable-save-password-bubble",
+                    "--credentials-enable-service=false",
+                ]
+                
+                browser = None
+                for channel in ["chrome", None]:
+                    try:
+                        launch_kwargs = {
+                            "headless": False,
+                            "args": args,
+                        }
+                        if playwright_proxy:
+                            launch_kwargs["proxy"] = playwright_proxy
+                        if channel:
+                            launch_kwargs["channel"] = channel
+                        
+                        browser = await pw.chromium.launch(**launch_kwargs)
+                        log(f"launched local headed browser (channel={channel}, proxy={proxy_str})")
+                        break
+                    except Exception as e:
+                        if channel is None:
+                            raise e
+                        continue
+
+                if not browser:
+                    raise RuntimeError("Failed to launch any browser")
+
+                context = await browser.new_context(
+                    viewport={"width": 1280, "height": 800},
+                    locale="en-US",
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/136.0.0.0 Safari/537.36"
+                    ),
+                )
+                page = await context.new_page()
+
+                if getattr(mod, "_HAS_STEALTH", False) and getattr(mod, "_stealth_obj", None):
+                    await mod._stealth_obj.apply_stealth_async(page)
+
+                await context.add_init_script("""
+                    try {
+                        Object.defineProperty(document, 'hidden', {get: () => false});
+                        Object.defineProperty(document, 'visibilityState', {get: () => 'visible'});
+                    } catch(e){}
+                    try {
+                        document.hasFocus = function(){ return true; };
+                    } catch(e){}
+                """)
+
+                email, password = await mod.register_outlook(page, context, idx)
+                cookies = []
+                if email:
+                    try:
+                        all_cookies = await context.cookies()
+                        keep_domains = (
+                            "outlook.", "live.com", "microsoftonline.",
+                            "microsoft.com", "office.com", ".office365.",
+                            "msn.com", "bing.com", "mail.live.com",
+                        )
+                        cookies = [
+                            c for c in all_cookies
+                            if any(d in (c.get("domain") or "") for d in keep_domains)
+                        ]
+                    except Exception as e:
+                        log(f"cookie export failed: {e}", "WARN")
+
+                await browser.close()
+                return email, password, cookies
+
+        except Exception as e:
+            log(f"one_attempt error: {e}", "WARN")
+            return None, None, []
 
 
 def main():
@@ -341,6 +434,8 @@ def main():
                     help="seconds between attempts (after fail or success)")
     ap.add_argument("--sleep-when-full", type=int, default=60,
                     help="seconds to sleep when pool is at target")
+    ap.add_argument("--driver", default="bitbrowser", choices=["bitbrowser", "playwright"],
+                    help="browser driver to use (default: bitbrowser)")
     args = ap.parse_args()
 
     os.environ.setdefault("OUTLOOK_REG_MAX_PRESS", args.max_press)
@@ -352,6 +447,12 @@ def main():
 
     mod = load_standalone()
     proxy = clash_proxy_from_env()
+    if not proxy:
+        clash_proxy = os.environ.get("CLASH_PROXY")
+        if clash_proxy:
+            os.environ["HTTP_PROXY"] = clash_proxy
+            os.environ["HTTPS_PROXY"] = clash_proxy
+            proxy = clash_proxy_from_env()
     if not proxy:
         log("HTTP_PROXY not set — running without proxy (signup will likely fail)", "WARN")
     else:
@@ -387,7 +488,7 @@ def main():
         cookies = []
         try:
             email, password, cookies = asyncio.run(
-                asyncio.wait_for(one_attempt(mod, proxy, n), timeout=args.timeout)
+                asyncio.wait_for(one_attempt(mod, proxy, n, args.driver), timeout=args.timeout)
             )
         except Exception as e:
             log(f"attempt raised {type(e).__name__}: {str(e)[:200]}", "WARN")

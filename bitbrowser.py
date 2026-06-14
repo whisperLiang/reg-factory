@@ -49,12 +49,14 @@ class BitBrowser:
         """获取浏览器窗口列表"""
         return self._post("/browser/list", {"page": page, "pageSize": page_size})
 
-    def open_browser(self, profile_id):
+    def open_browser(self, profile_id, args=None):
         """
         打开浏览器窗口，返回 WebSocket 调试地址
         返回: {"ws": "ws://...", "http": "http://..."}
         """
-        result = self._post("/browser/open", {"id": profile_id})
+        if args is None:
+            args = ["--disable-save-password-bubble", "--credentials-enable-service=false"]
+        result = self._post("/browser/open", {"id": profile_id, "args": args})
         return result["data"]
 
     def close_browser(self, profile_id):
@@ -103,6 +105,8 @@ class BitBrowser:
             "remark": "claude.ai 自动注册",
             "proxyMethod": 2,  # 自定义代理
             "proxyType": "noproxy",
+            "credentialsEnableService": False,
+            "syncAuthorization": False,
             "browserFingerPrint": {
                 "coreVersion": "130",
             },

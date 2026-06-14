@@ -118,12 +118,24 @@ class BitBrowserClient:
         """Create a new browser profile with optional proxy.
         proxy_str format: user:pass@host:port
         """
+        bb_core_ver = os.environ.get("BB_CORE_VERSION", "146")
         data = {
             "name": name,
             "remark": "outlook standalone registration",
+            "platform": "https://outlook.live.com",
+            "platformIcon": "outlook.live.com",
             "proxyMethod": 2,  # custom proxy
+            "credentialsEnableService": False,
+            "syncAuthorization": False,
             "browserFingerPrint": {
-                "coreVersion": "130",
+                "ostype": "PC",
+                "os": "Win32",
+                "coreVersion": bb_core_ver,
+                "isIpCreateTimeZone": True,
+                "isIpCreateLanguage": True,
+                "isIpCreateDisplayLanguage": True,
+                "isIpCreatePosition": True,
+                "isIpCountry": True,
             },
         }
 
@@ -149,9 +161,11 @@ class BitBrowserClient:
         print(f"  browser created: {name} (ID: {profile_id})")
         return profile_id
 
-    def open_browser(self, profile_id):
+    def open_browser(self, profile_id, args=None):
         """Open browser window, returns WebSocket debug URL"""
-        result = self._post("/browser/open", {"id": profile_id})
+        if args is None:
+            args = ["--disable-save-password-bubble", "--credentials-enable-service=false"]
+        result = self._post("/browser/open", {"id": profile_id, "args": args})
         return result["data"]
 
     def close_browser(self, profile_id):
@@ -603,6 +617,69 @@ async def extract_graph_token(page, context, email, password, idx=0):
         return None
 
 
+async def detect_name_inputs(page):
+    """Detect First Name and Last Name inputs on the page.
+    Returns (fname_input, lname_input) if found, else (None, None).
+    """
+    try:
+        all_inputs = page.locator('input')
+        input_count = await all_inputs.count()
+        visible_text_inputs = []
+        for i in range(input_count):
+            inp = all_inputs.nth(i)
+            if await inp.is_visible():
+                inp_type = (await inp.get_attribute("type") or "text").lower()
+                if inp_type in ["text", "string", "number", "email", "tel"]:
+                    visible_text_inputs.append(inp)
+        
+        if len(visible_text_inputs) < 2:
+            return None, None
+        
+        fname_input = None
+        lname_input = None
+        
+        # Try to identify by attributes/labels
+        for inp in visible_text_inputs:
+            inp_id = (await inp.get_attribute("id") or "").lower()
+            inp_name = (await inp.get_attribute("name") or "").lower()
+            inp_placeholder = (await inp.get_attribute("placeholder") or "").lower()
+            inp_label = (await inp.get_attribute("aria-label") or "").lower()
+            
+            # Evaluate label/container text
+            label_text = ""
+            try:
+                label_text = (await page.evaluate("""(el) => {
+                    let label = document.querySelector('label[for="' + el.id + '"]');
+                    if (label) return label.textContent;
+                    let parent = el.closest('div');
+                    if (parent) return parent.innerText;
+                    return '';
+                }""", await inp.element_handle())).lower()
+            except Exception:
+                pass
+
+            combined = f"{inp_id} {inp_name} {inp_placeholder} {inp_label} {label_text}"
+            
+            if any(kw in combined for kw in ["first", "prénom", "given", "名"]) and not any(kw in combined for kw in ["last", "姓"]):
+                fname_input = inp
+            elif any(kw in combined for kw in ["last", "nom de famille", "surname", "姓"]):
+                lname_input = inp
+                
+        if fname_input and lname_input:
+            return fname_input, lname_input
+            
+        # Fallback to positional check based on locale
+        page_text = await page.evaluate("() => document.body.innerText")
+        if "姓氏" in page_text or "姓名" in page_text:
+            # Chinese order: 1st is Last Name, 2nd is First Name
+            return visible_text_inputs[1], visible_text_inputs[0]
+        else:
+            # Western order: 1st is First Name, 2nd is Last Name
+            return visible_text_inputs[0], visible_text_inputs[1]
+    except Exception:
+        return None, None
+
+
 # ======================== Outlook Registration ========================
 
 async def register_outlook(page, context, idx=0, captcha_early_abort=False):
@@ -617,6 +694,17 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
     tag = f"[#{idx}]"
 
+    # Monkeypatch page.screenshot to be exception-safe and avoid slow font load timeouts
+    original_screenshot = page.screenshot
+    async def safe_screenshot_wrapper(*args, **kwargs):
+        if 'timeout' not in kwargs:
+            kwargs['timeout'] = 5000
+        try:
+            return await original_screenshot(*args, **kwargs)
+        except Exception as se:
+            print(f"  {tag} [screenshot] warning: screenshot failed ({se})")
+    page.screenshot = safe_screenshot_wrapper
+
     try:
         print(f"  {tag} navigating to signup page...")
         await page.goto("https://signup.live.com/signup?lic=1", timeout=60000, wait_until="domcontentloaded")
@@ -628,15 +716,24 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
             page_text = await page.evaluate("() => document.body.innerText")
             current_url = page.url.lower()
             # Check if on a consent/privacy page (not the actual signup form)
-            # Only trigger for actual privacy/consent standalone pages, not signup pages with footer links
-            is_signup_form = "signup.live.com" in current_url and "privacynotice" not in current_url
-            if not is_signup_form and (
-                any(kw in page_text for kw in ["同意并继续", "个人数据", "数据导出"]) or \
-                any(kw in page_text.lower() for kw in [
-                    "agree and continue", "consent", "data export",
-                    "accepter et continuer", "consentement",
-                ]) or "privacynotice" in current_url
-            ):
+            email_input_count = await page.locator(
+                'input[type="email"], input[name="MemberName"], input[id="MemberName"], '
+                'input[id="usernameInput"], input[name="Username"]'
+            ).count()
+            has_email_input = email_input_count > 0
+
+            is_consent = False
+            if "privacynotice" in current_url:
+                is_consent = True
+            elif not has_email_input:
+                if any(kw in page_text for kw in ["同意并继续", "个人数据", "数据导出", "个人数据导出许可", "同意"]) or \
+                   any(kw in page_text.lower() for kw in [
+                       "agree and continue", "consent", "data export",
+                       "accepter et continuer", "consentement",
+                   ]):
+                    is_consent = True
+
+            if is_consent:
                 print(f"  {tag} privacy/consent page detected, clicking accept...")
                 clicked = False
                 # Try various accept buttons
@@ -700,48 +797,105 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
             ).first
             has_domain_dropdown = await domain_dropdown.count() > 0
 
-            await email_input.fill("")
+            try:
+                await email_input.fill("", timeout=5000)
+            except Exception:
+                try:
+                    await page.evaluate("(el) => { el.value = ''; }", await email_input.element_handle())
+                except Exception:
+                    pass
             await asyncio.sleep(0.3)
             if has_domain_dropdown:
-                await email_input.fill(prefix)
+                try:
+                    await email_input.fill(prefix, timeout=5000)
+                except Exception:
+                    try:
+                        await page.evaluate("(el, val) => { el.value = val; el.dispatchEvent(new Event('input', {bubbles:true})); }", [await email_input.element_handle(), prefix])
+                    except Exception:
+                        pass
                 try:
                     await domain_dropdown.select_option("outlook.com")
                 except Exception:
                     pass
                 print(f"  {tag} filled prefix: {prefix} (dropdown)")
             else:
-                await email_input.fill(email)
+                try:
+                    await email_input.fill(email, timeout=5000)
+                except Exception:
+                    try:
+                        await page.evaluate("(el, val) => { el.value = val; el.dispatchEvent(new Event('input', {bubbles:true})); }", [await email_input.element_handle(), email])
+                    except Exception:
+                        pass
                 print(f"  {tag} filled email: {email}")
 
             await asyncio.sleep(0.5)
             for sel in ['input[type="submit"]', 'button[type="submit"]', '#iSignupAction', 'button[id="iSignupAction"]']:
                 btn = page.locator(sel).first
                 if await btn.count() > 0:
-                    await btn.click(timeout=3000)
+                    try:
+                        await btn.click(timeout=3000)
+                    except Exception:
+                        pass
                     break
-            await asyncio.sleep(3)
+            
+            # Submit loop
+            submitted = False
+            for submit_retry in range(12):  # Wait up to ~12 seconds
+                pwd_input_check = page.locator(
+                    'input[type="password"], input[name="Password"], '
+                    'input[id="PasswordInput"], input[name="passwd"]'
+                ).first
+                if await pwd_input_check.count() > 0 and await pwd_input_check.is_visible():
+                    submitted = True
+                    break
 
-            page_text = await page.evaluate("() => document.body.innerText")
-            page_lower = page_text.lower()
+                page_text = await page.evaluate("() => document.body.innerText")
+                page_lower = page_text.lower()
+                
+                # Check taken errors
+                if ("already" in page_lower and "email" in page_lower) or "taken" in page_lower or \
+                   "有人已具有此" in page_lower or "有人已经" in page_lower or "已被使用" in page_lower or "someone already" in page_lower:
+                    prefix = random.choice(string.ascii_lowercase) + "".join(
+                        random.choices(string.ascii_lowercase + string.digits, k=11)
+                    )
+                    email = f"{prefix}@outlook.com"
+                    print(f"  {tag} email taken, retry: {email}")
+                    break
 
-            if ("already" in page_lower and "email" in page_lower) or "taken" in page_lower:
-                prefix = random.choice(string.ascii_lowercase) + "".join(
-                    random.choices(string.ascii_lowercase + string.digits, k=11)
-                )
-                email = f"{prefix}@outlook.com"
-                print(f"  {tag} email taken, retry: {email}")
+                # Check format errors
+                if "needs to start" in page_lower or "in the format" in page_lower or "enter a valid" in page_lower or \
+                   "use letters" in page_lower or "格式不正确" in page_lower or "请输入有效的" in page_lower or \
+                   "以字母" in page_lower or "valid email" in page_lower:
+                    prefix = random.choice(string.ascii_lowercase) + "".join(
+                        random.choices(string.ascii_lowercase + string.digits, k=9)
+                    )
+                    email = f"{prefix}@outlook.com"
+                    print(f"  {tag} format error, retry: {email}")
+                    break
+
+                # Retry submitting email if stuck
+                if submit_retry > 0 and submit_retry % 3 == 0:
+                    print(f"  {tag} email submit slow, retrying click/Enter...")
+                    try:
+                        await email_input.press("Enter")
+                    except Exception:
+                        pass
+                    for sel in ['input[type="submit"]', 'button[type="submit"]', '#iSignupAction', 'button[id="iSignupAction"]']:
+                        btn = page.locator(sel).first
+                        if await btn.count() > 0:
+                            try:
+                                await btn.click(timeout=2000)
+                            except Exception:
+                                pass
+                            break
+                await asyncio.sleep(1)
+            else:
+                print(f"  {tag} email submission timed out")
                 continue
 
-            if "needs to start" in page_lower or "in the format" in page_lower or "enter a valid" in page_lower or "use letters" in page_lower:
-                prefix = random.choice(string.ascii_lowercase) + "".join(
-                    random.choices(string.ascii_lowercase + string.digits, k=9)
-                )
-                email = f"{prefix}@outlook.com"
-                print(f"  {tag} format error, retry: {email}")
-                continue
-
-            email_ok = True
-            break
+            if submitted:
+                email_ok = True
+                break
 
         if not email_ok:
             print(f"  {tag} all email attempts failed")
@@ -751,7 +905,7 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
         await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_after_email.png")
 
         # Step 2: Enter password
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
         pwd_input = None
         for _ in range(10):
             pwd_input = page.locator(
@@ -780,9 +934,93 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                     except Exception:
                         pass
             if not clicked_next:
-                await page.keyboard.press("Enter")
+                try:
+                    await pwd_input.press("Enter")
+                except Exception:
+                    await page.keyboard.press("Enter")
 
-            await asyncio.sleep(3)
+            # Wait loop for transition after password submit
+            pwd_submitted = False
+            for pwd_retry in range(15):
+                combos = page.locator('button[role="combobox"], [role="combobox"], select')
+                combo_count = await combos.count()
+                any_visible_combo = False
+                for ci in range(combo_count):
+                    try:
+                        if await combos.nth(ci).is_visible():
+                            any_visible_combo = True
+                            break
+                    except Exception:
+                        pass
+                
+                year_input = page.locator('#BirthYearInput, [aria-label*="year" i], [aria-label*="年" i], [id*="Year" i], [id*="year" i]')
+                has_year = await year_input.count() > 0 and await year_input.first.is_visible()
+                
+                fname_input = page.locator(
+                    'input[name="FirstName"], input[id="FirstName"], input[name="firstNameInput"], '
+                    'input[id="firstNameInput"], input[aria-label*="first" i], input[placeholder*="first" i], '
+                    'input[aria-label*="名" i], input[placeholder*="名" i]'
+                )
+                has_name = await fname_input.count() > 0 and await fname_input.first.is_visible()
+
+                username_input = page.locator('input[id*="displayName"], input[id*="gamertag"]')
+                has_username = await username_input.count() > 0 and await username_input.first.is_visible()
+
+                # Check page text for blocked error
+                page_text = await page.evaluate("() => document.body.innerText")
+                page_lower = page_text.lower()
+                has_blocked = any(kw in page_text for kw in [
+                    "帐户创建已被阻止", "已被阻止", "阻止创建",
+                    "account creation has been blocked", "has been blocked", "account has been suspended",
+                    "création de compte a été bloquée", "a été bloquée", "bloquée"
+                ]) or "unusual activity" in page_lower or "异常活动" in page_lower
+
+                # Check for captcha
+                has_captcha_visible = False
+                for sel in ['button:has-text("Press and hold")', 'button:has-text("Appuyer et maintenir")',
+                            'button:has-text("按住")', 'button:has-text("长按")',
+                            'button:has-text("Halten")', '#px-captcha']:
+                    el = page.locator(sel).first
+                    if await el.count() > 0 and await el.is_visible():
+                        has_captcha_visible = True
+                        break
+                if not has_captcha_visible:
+                    ifr = page.locator('iframe[src*="hsprotect.net"], iframe[src*="arkose"], iframe[src*="funcaptcha"]')
+                    for hi in range(await ifr.count()):
+                        b = await ifr.nth(hi).bounding_box()
+                        if b and b['width'] > 50 and b['height'] > 30:
+                            has_captcha_visible = True
+                            break
+
+                if any_visible_combo or has_year or has_name or has_username or has_blocked or has_captcha_visible:
+                    pwd_submitted = True
+                    break
+
+                # Check if password input is gone
+                if await pwd_input.count() == 0 or not await pwd_input.is_visible():
+                    pwd_submitted = True
+                    break
+
+                # Retry submitting password if stuck
+                if pwd_retry > 0 and pwd_retry % 3 == 0:
+                    print(f"  {tag} password submit slow, retrying click/Enter...")
+                    try:
+                        await pwd_input.press("Enter")
+                    except Exception:
+                        pass
+                    for sel in ['#iSignupAction', 'input[type="submit"]', 'button[type="submit"]',
+                                'button:has-text("Next")', 'button:has-text("next")',
+                                'button:has-text("下一步")', 'button:has-text("Suivant")']:
+                        btn = page.locator(sel).first
+                        if await btn.count() > 0:
+                            try:
+                                await btn.click(timeout=2000)
+                            except Exception:
+                                pass
+                            break
+
+                await asyncio.sleep(1)
+
             await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_after_pwd.png")
         else:
             print(f"  {tag} password input not found")
@@ -792,15 +1030,33 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
         year, month, day = generate_birthday()
         await asyncio.sleep(2)
 
-        # Wait for birthday page to load (CN/EN/FR)
-        for _ in range(10):
-            page_text = await page.evaluate("() => document.body.innerText")
-            if any(kw in page_text.lower() for kw in [
-                "birth", "country", "region",
-                "naissance", "pays", "région", "détails",
-            ]) or any(kw in page_text for kw in ["出生", "国家", "地区", "年份", "详细信息"]):
+        # Wait for birthday page elements to be visible
+        for _ in range(15):
+            combos = page.locator('button[role="combobox"], [role="combobox"], select')
+            combo_count = await combos.count()
+            any_visible_combo = False
+            for ci in range(combo_count):
+                try:
+                    if await combos.nth(ci).is_visible():
+                        any_visible_combo = True
+                        break
+                except Exception:
+                    pass
+            
+            year_input = page.locator('#BirthYearInput, [aria-label*="year" i], [aria-label*="年" i], [id*="Year" i], [id*="year" i]')
+            has_year = await year_input.count() > 0 and await year_input.first.is_visible()
+            
+            if any_visible_combo or has_year:
                 break
             await asyncio.sleep(1)
+
+        # Dismiss browser password saver popup on the right (press Escape)
+        try:
+            await page.click('body', force=True, timeout=2000)
+            await page.keyboard.press("Escape")
+            await asyncio.sleep(0.5)
+        except Exception:
+            pass
 
         await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_bday_page.png")
 
@@ -853,110 +1109,80 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
             # Chinese month names: 1月, 2月, ... 12月
             month_names_cn = ["", "1月", "2月", "3月", "4月", "5月", "6月",
                               "7月", "8月", "9月", "10月", "11月", "12月"]
+            # Chinese month names in characters (一月, 二月, ... 十二月)
+            month_names_cn_text = ["", "一月", "二月", "三月", "四月", "五月", "六月",
+                                   "七月", "八月", "九月", "十月", "十一月", "十二月"]
             # French month names
             month_names_fr = ["", "janvier", "février", "mars", "avril", "mai", "juin",
                               "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
 
-            # Find all visible comboboxes
-            combos = page.locator('button[role="combobox"], [role="combobox"]')
-            combo_count = await combos.count()
-            print(f"  {tag} found {combo_count} comboboxes")
+            # Direct selection of Month and Day comboboxes
+            # Direct selection of Month and Day comboboxes
+            month_combo = page.locator('#BirthMonthDropdown, button[name="BirthMonth"], button[aria-label*="出生月份" i], button[aria-label*="month" i]').first
+            day_combo = page.locator('#BirthDayDropdown, button[name="BirthDay"], button[aria-label*="出生日期" i], button[aria-label*="day" i]').first
 
-            # Strategy: identify combos by their text/aria-label/position
-            # Typically order is: Country, Month, Day (country may already be set)
-            month_filled = False
-            day_filled = False
-
-            for ci in range(combo_count):
-                combo = combos.nth(ci)
-                try:
-                    box = await combo.bounding_box()
-                    if not box or box['width'] < 10:
-                        continue
-                    combo_text = (await combo.text_content() or "").strip()
-                    combo_label = (await combo.get_attribute("aria-label") or "").lower()
-                    combo_id = (await combo.get_attribute("id") or "").lower()
-                    info = f"text='{combo_text}' label='{combo_label}' id='{combo_id}'"
-                    print(f"  {tag} combo[{ci}]: {info}")
-
-                    # Multi-language detection: EN/CN/FR/ES/DE/PT
-                    is_month = any(kw in combo_label for kw in ["month", "月", "mois", "mes", "monat", "mês"]) or \
-                               any(kw in combo_id for kw in ["month", "birthmonth"]) or \
-                               combo_text in ["月", "Month", "月份", "Mois", "Mes"]
-                    is_day = any(kw in combo_label for kw in ["day", "日", "jour", "día", "tag", "dia"]) or \
-                             any(kw in combo_id for kw in ["day", "birthday"]) or \
-                             combo_text in ["日", "Day", "Jour", "Día"]
-
-                    # Disambiguate: if id contains both "day" and "month" substrings, use the more specific match
-                    if is_month and is_day:
-                        # Prefer the specific keyword: "birthdaydropdown" → day, "birthmonthdropdown" → month
-                        if "month" in combo_id:
-                            is_day = False
-                        elif "day" in combo_id:
-                            is_month = False
-
-                    # If text contains "月" or "日" at end, it's already showing a value
-                    if not is_month and not is_day:
-                        if combo_text.endswith("月") and len(combo_text) <= 3:
-                            is_month = True
-                        elif combo_text.endswith("日") and len(combo_text) <= 4:
-                            is_day = True
-
-                    if is_month and not month_filled:
-                        await combo.click(force=True)
-                        await asyncio.sleep(1)
-                        # Try month option (Chinese → English → French → number)
-                        month_opt = page.locator(f'[role="option"]:has-text("{month_names_cn[month]}")').first
-                        if await month_opt.count() == 0:
-                            month_opt = page.locator(f'[role="option"]:has-text("{month_names_en[month]}")').first
-                        if await month_opt.count() == 0:
-                            month_opt = page.locator(f'[role="option"]:has-text("{month_names_fr[month]}")').first
-                        if await month_opt.count() == 0:
-                            month_opt = page.locator(f'[role="option"]:has-text("{month}")').first
-                        if await month_opt.count() > 0:
-                            await month_opt.click()
-                            month_filled = True
-                            print(f"  {tag} month: {month}")
-                        else:
-                            await page.keyboard.type(str(month))
-                            await asyncio.sleep(0.3)
-                            await page.keyboard.press("Enter")
-                            month_filled = True
-                        await asyncio.sleep(1)
-
-                    elif is_day and not day_filled:
-                        await combo.click(force=True)
-                        await asyncio.sleep(1)
-                        # Try day option: exact match first to avoid "1" matching "10","11"...
-                        day_str = str(day)
-                        # Try exact match via all options
-                        day_opt = None
+            async def select_fluent_combo(combo_locator, target_val, possible_texts, tag_name):
+                for attempt in range(3):
+                    # Click to expand dropdown
+                    try:
+                        await combo_locator.hover(timeout=1000)
+                        await combo_locator.click(timeout=3000)
+                    except Exception:
                         try:
-                            all_opts = page.locator('[role="option"]')
-                            opt_count = await all_opts.count()
-                            for oi in range(opt_count):
-                                opt_text = (await all_opts.nth(oi).text_content() or "").strip()
-                                if opt_text == day_str or opt_text == f"{day}日":
-                                    day_opt = all_opts.nth(oi)
-                                    break
+                            await combo_locator.click(timeout=3000, force=True)
                         except Exception:
                             pass
-                        if not day_opt:
-                            day_opt = page.locator(f'[role="option"]:has-text("{day}日")').first
-                        if not day_opt or await day_opt.count() == 0:
-                            day_opt = page.locator(f'[role="option"]:has-text("{day_str}")').first
-                        if await day_opt.count() > 0:
-                            await day_opt.click()
-                            day_filled = True
-                            print(f"  {tag} day: {day}")
-                        else:
-                            await page.keyboard.type(str(day))
-                            await asyncio.sleep(0.3)
-                            await page.keyboard.press("Enter")
-                            day_filled = True
-                        await asyncio.sleep(1)
-                except Exception as e:
-                    print(f"  {tag} combo[{ci}] error: {e}")
+                    await asyncio.sleep(0.8)
+
+                    # Try to find and click option
+                    clicked = await page.evaluate("""([val, texts]) => {
+                        const options = Array.from(document.querySelectorAll('[role="option"], fluent-option, [class*="option"]'))
+                            .filter(e => e.offsetParent !== null);
+                        for (const opt of options) {
+                            const txt = (opt.textContent || '').trim().toLowerCase();
+                            if (txt === String(val) || texts.map(t => String(t).toLowerCase()).includes(txt)) {
+                                opt.click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    }""", [target_val, possible_texts])
+                    
+                    if clicked:
+                        print(f"  {tag} {tag_name}: {target_val} (clicked)")
+                        return True
+                    await asyncio.sleep(0.5)
+                
+                # Fallback to keyboard navigation
+                try:
+                    await combo_locator.focus()
+                    await asyncio.sleep(0.3)
+                    await page.keyboard.press("Alt+ArrowDown")
+                    await asyncio.sleep(0.3)
+                    for _ in range(target_val):
+                        await page.keyboard.press("ArrowDown")
+                        await asyncio.sleep(0.05)
+                    await page.keyboard.press("Enter")
+                    await asyncio.sleep(0.3)
+                    print(f"  {tag} {tag_name}: {target_val} (keyboard)")
+                    return True
+                except Exception as ke:
+                    print(f"  {tag} {tag_name} keyboard fallback failed: {ke}")
+                return False
+
+            # Fill Month
+            month_filled = await select_fluent_combo(
+                month_combo, month,
+                [month_names_cn[month], month_names_cn_text[month], month_names_en[month], month_names_fr[month]],
+                "month"
+            )
+
+            # Fill Day
+            day_filled = await select_fluent_combo(
+                day_combo, day,
+                [f"{day}日", str(day)],
+                "day"
+            )
 
             if not month_filled or not day_filled:
                 print(f"  {tag} WARNING: month_filled={month_filled}, day_filled={day_filled}")
@@ -990,68 +1216,164 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                 await btn.click(timeout=3000)
                 print(f"  {tag} clicked next (bday): {sel}")
                 break
-        await asyncio.sleep(3)
-        await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_after_bday.png")
 
-        # Step 4: Username/Gamertag (Chinese: 游戏标签/用户名)
-        await asyncio.sleep(2)
-        username_input = page.locator(
-            'input[id*="displayName"], input[id*="gamertag"], input[name*="displayName"], '
-            'input[placeholder*="name"], input[type="text"]'
-        ).first
-        if await username_input.count() > 0:
+        # Wait up to 15 seconds for transition to Name, Username, Captcha, or Blocked
+        for _bday_submit_retry in range(15):
+            fname_check, lname_check = await detect_name_inputs(page)
+            has_name = fname_check is not None and lname_check is not None
+            
+            username_input_check = page.locator(
+                'input[id*="displayName"], input[id*="gamertag"], input[name*="displayName"]'
+            ).first
+            
+            # Captcha check
+            has_captcha_visible = False
+            for sel in ['button:has-text("Press and hold")', 'button:has-text("Appuyer et maintenir")',
+                        'button:has-text("按住")', 'button:has-text("长按")',
+                        'button:has-text("Halten")', '#px-captcha']:
+                el = page.locator(sel).first
+                if await el.count() > 0 and await el.is_visible():
+                    has_captcha_visible = True
+                    break
+            if not has_captcha_visible:
+                ifr = page.locator('iframe[src*="hsprotect.net"], iframe[src*="arkose"], iframe[src*="funcaptcha"]')
+                for hi in range(await ifr.count()):
+                    b = await ifr.nth(hi).bounding_box()
+                    if b and b['width'] > 50 and b['height'] > 30:
+                        has_captcha_visible = True
+                        break
+
+            # Blocked check
             page_text = await page.evaluate("() => document.body.innerText")
-            if any(kw in page_text.lower() for kw in ["name", "gamertag", "nom", "pseudo", "surnom"]) or \
-               any(kw in page_text for kw in ["用户名", "游戏标签", "显示名称"]):
-                username = prefix[:8] + str(random.randint(100, 999))
-                await username_input.fill(username)
-                print(f"  {tag} username: {username}")
-                await asyncio.sleep(0.5)
+            page_lower = page_text.lower()
+            has_blocked = any(kw in page_text for kw in [
+                "帐户创建已被阻止", "已被阻止", "阻止创建",
+                "account creation has been blocked", "has been blocked", "account has been suspended",
+                "création de compte a été bloquée", "a été bloée", "bloquée"
+            ]) or "unusual activity" in page_lower or "异常活动" in page_lower
+
+            if has_name or \
+               (await username_input_check.count() > 0 and await username_input_check.is_visible()) or \
+               has_captcha_visible or has_blocked:
+                break
+
+            # Retry next button click if stuck
+            if _bday_submit_retry > 0 and _bday_submit_retry % 3 == 0:
+                print(f"  {tag} birthdate submit slow, retrying next button click...")
                 for sel in ['input[type="submit"]', 'button[type="submit"]', '#iSignupAction',
-                            'button:has-text("下一步")', 'button:has-text("Next")',
+                            'button[id="iSignupAction"]', 'button:has-text("下一步")',
+                            'button:has-text("Next")', 'button:has-text("next")',
                             'button:has-text("Suivant")']:
                     btn = page.locator(sel).first
                     if await btn.count() > 0:
-                        await btn.click(timeout=3000)
+                        try:
+                            await btn.click(timeout=2000)
+                            break
+                        except Exception:
+                            pass
+            await asyncio.sleep(1)
+
+        await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_after_bday.png")
+
+        # Step 4: Username/Gamertag (Chinese: 游戏标签/用户名)
+        username_input = page.locator(
+            'input[id*="displayName"], input[id*="gamertag"], input[name*="displayName"]'
+        ).first
+        if await username_input.count() > 0 and await username_input.is_visible():
+            username = prefix[:8] + str(random.randint(100, 999))
+            await username_input.fill(username)
+            print(f"  {tag} username: {username}")
+            await asyncio.sleep(0.5)
+            
+            # Click next on username
+            for sel in ['input[type="submit"]', 'button[type="submit"]', '#iSignupAction',
+                        'button:has-text("下一步")', 'button:has-text("Next")',
+                        'button:has-text("Suivant")']:
+                btn = page.locator(sel).first
+                if await btn.count() > 0:
+                    await btn.click(timeout=3000)
+                    break
+            
+            # Wait up to 15 seconds for transition to First/Last Name, Captcha, or Blocked
+            for _user_submit_retry in range(15):
+                fname_check, lname_check = await detect_name_inputs(page)
+                has_name = fname_check is not None and lname_check is not None
+                
+                has_captcha_visible = False
+                for sel in ['button:has-text("Press and hold")', 'button:has-text("Appuyer et maintenir")',
+                            'button:has-text("按住")', 'button:has-text("长按")',
+                            'button:has-text("Halten")', '#px-captcha']:
+                    el = page.locator(sel).first
+                    if await el.count() > 0 and await el.is_visible():
+                        has_captcha_visible = True
                         break
-                await asyncio.sleep(3)
+                if not has_captcha_visible:
+                    ifr = page.locator('iframe[src*="hsprotect.net"], iframe[src*="arkose"], iframe[src*="funcaptcha"]')
+                    for hi in range(await ifr.count()):
+                        b = await ifr.nth(hi).bounding_box()
+                        if b and b['width'] > 50 and b['height'] > 30:
+                            has_captcha_visible = True
+                            break
+
+                page_text = await page.evaluate("() => document.body.innerText")
+                page_lower = page_text.lower()
+                has_blocked = any(kw in page_text for kw in [
+                    "帐户创建已被阻止", "已被阻止", "阻止创建",
+                    "account creation has been blocked", "has been blocked", "account has been suspended",
+                    "création de compte a été bloquée", "a été bloquée", "bloquée"
+                ]) or "unusual activity" in page_lower or "异常活动" in page_lower
+
+                if has_name or has_captcha_visible or has_blocked:
+                    break
+
+                # Retry next on username if stuck
+                if _user_submit_retry > 0 and _user_submit_retry % 3 == 0:
+                    print(f"  {tag} username submit slow, retrying next button click...")
+                    for sel in ['input[type="submit"]', 'button[type="submit"]', '#iSignupAction',
+                                'button:has-text("下一步")', 'button:has-text("Next")',
+                                'button:has-text("Suivant")']:
+                        btn = page.locator(sel).first
+                        if await btn.count() > 0:
+                            try:
+                                await btn.click(timeout=2000)
+                                break
+                            except Exception:
+                                pass
+                await asyncio.sleep(1)
 
         # Step 5: First/Last Name + checkbox (Chinese: 姓/名)
         first_name, last_name = generate_name()
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
 
-        for _ in range(10):
-            fname_input = page.locator(
-                'input[name="FirstName"], input[id="FirstName"], input[name="firstNameInput"], '
-                'input[id="firstNameInput"], input[aria-label*="first" i], input[placeholder*="first" i], '
-                'input[aria-label*="名" i], input[placeholder*="名" i], '
-                'input[aria-label*="prénom" i], input[placeholder*="prénom" i]'
-            ).first
-            lname_input = page.locator(
-                'input[name="LastName"], input[id="LastName"], input[name="lastNameInput"], '
-                'input[id="lastNameInput"], input[aria-label*="last" i], input[aria-label*="surname" i], '
-                'input[placeholder*="last" i], input[aria-label*="姓" i], input[placeholder*="姓" i], '
-                'input[aria-label*="nom de famille" i], input[placeholder*="nom de famille" i]'
-            ).first
-            if await fname_input.count() > 0 or await lname_input.count() > 0:
-                break
-            all_text_inputs = page.locator('input[type="text"]')
-            if await all_text_inputs.count() >= 2:
+        fname_input = None
+        lname_input = None
+        for _ in range(15):
+            fname_input, lname_input = await detect_name_inputs(page)
+            if fname_input and lname_input:
                 break
             await asyncio.sleep(1)
 
-        if await fname_input.count() > 0:
-            if await lname_input.count() > 0:
-                await lname_input.fill(last_name)
+        if fname_input and lname_input:
+            await lname_input.fill(last_name)
             await fname_input.fill(first_name)
             print(f"  {tag} name: {first_name} {last_name}")
         else:
-            all_text_inputs = page.locator('input[type="text"]')
-            count = await all_text_inputs.count()
-            if count >= 2:
-                await all_text_inputs.nth(0).fill(last_name)
-                await all_text_inputs.nth(1).fill(first_name)
-                print(f"  {tag} name (generic): {first_name} {last_name}")
+            # Fallback to general text inputs
+            all_text_inputs = page.locator('input')
+            visible_text_inputs = []
+            for i in range(await all_text_inputs.count()):
+                inp = all_text_inputs.nth(i)
+                if await inp.is_visible():
+                    inp_type = (await inp.get_attribute("type") or "text").lower()
+                    if inp_type in ["text", "string", "number", "email", "tel"]:
+                        visible_text_inputs.append(inp)
+            if len(visible_text_inputs) >= 2:
+                # Fallback to Chinese order by default (first is last name, second is first name)
+                await visible_text_inputs[0].fill(last_name)
+                await visible_text_inputs[1].fill(first_name)
+                print(f"  {tag} name (fallback positional): {first_name} {last_name}")
+            else:
+                print(f"  {tag} WARNING: could not locate name inputs")
 
         checkbox = page.locator('input[type="checkbox"], [role="checkbox"]').first
         if await checkbox.count() > 0:
@@ -1072,7 +1394,58 @@ async def register_outlook(page, context, idx=0, captcha_early_abort=False):
                 await btn.click(timeout=3000)
                 print(f"  {tag} clicked next (name): {sel}")
                 break
-        await asyncio.sleep(3)
+
+        # Wait up to 15 seconds for transition to Captcha page or Blocked page
+        for _name_submit_retry in range(15):
+            has_captcha_visible = False
+            for sel in ['button:has-text("Press and hold")', 'button:has-text("Appuyer et maintenir")',
+                        'button:has-text("按住")', 'button:has-text("长按")',
+                        'button:has-text("Halten")', '#px-captcha']:
+                el = page.locator(sel).first
+                if await el.count() > 0 and await el.is_visible():
+                    has_captcha_visible = True
+                    break
+            if not has_captcha_visible:
+                ifr = page.locator('iframe[src*="hsprotect.net"], iframe[src*="arkose"], iframe[src*="funcaptcha"]')
+                for hi in range(await ifr.count()):
+                    b = await ifr.nth(hi).bounding_box()
+                    if b and b['width'] > 50 and b['height'] > 30:
+                        has_captcha_visible = True
+                        break
+
+            page_text = await page.evaluate("() => document.body.innerText")
+            page_lower = page_text.lower()
+            has_blocked = any(kw in page_text for kw in [
+                "帐户创建已被阻止", "已被阻止", "阻止创建",
+                "account creation has been blocked", "has been blocked", "account has been suspended",
+                "création de compte a été bloquée", "a été bloquée", "bloquée"
+            ]) or "unusual activity" in page_lower or "异常活动" in page_lower
+
+            current_url = page.url.lower()
+            on_signup_form = ("signup.live.com" in current_url) and ("privacynotice" not in current_url)
+            left_signup = not on_signup_form and any(h in current_url for h in [
+                "privacynotice", "account.microsoft.com", "account.live.com",
+                "outlook.live.com", "outlook.office", "login.live.com/oauth20"
+            ])
+
+            if has_captcha_visible or has_blocked or left_signup:
+                break
+
+            # Retry click next button if stuck
+            if _name_submit_retry > 0 and _name_submit_retry % 3 == 0:
+                print(f"  {tag} name submit slow, retrying next button click...")
+                for sel in ['input[type="submit"]', 'button[type="submit"]', '#iSignupAction',
+                            'button[id="iSignupAction"]', 'button:has-text("Next")',
+                            'button:has-text("下一步")', 'button:has-text("Suivant")']:
+                    btn = page.locator(sel).first
+                    if await btn.count() > 0:
+                        try:
+                            await btn.click(timeout=2000)
+                            break
+                        except Exception:
+                            pass
+            await asyncio.sleep(1)
+
         await page.screenshot(path=f"{SCREENSHOT_DIR}/outlook_{idx}_after_name.png")
 
         # Step 6: CAPTCHA handling
@@ -1838,7 +2211,7 @@ async def _register_one_browser(bb, idx, proxy_str):
                 err_msg = str(e)
                 if '最大创建窗口数' in err_msg or '超过' in err_msg:
                     print(f"  {tag} browser quota full, cleaning up...")
-                    bb.cleanup_browsers(keep=2)
+                    bb.cleanup_browsers(keep=0)
                     await asyncio.sleep(3)
                     continue
                 elif 'TLS' in err_msg or 'socket' in err_msg or 'ECONNRESET' in err_msg:
